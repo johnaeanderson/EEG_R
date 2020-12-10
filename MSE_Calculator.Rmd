@@ -1,0 +1,232 @@
+---
+title: "Multiscale entropy"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+Written by Dr. John A.E. Anderson in collaboration with Dr. John G. Grundy
+09/12/2020
+
+This is an attempt to write a multiscale entropy notebook based on the MSEntropy package in R (https://github.com/jcaude/MSEntropy)
+
+The first step is to read in the files matching a specific criteria (condition) using the readbulk package - we can then compute entopy within each participant. 
+
+First load the packages necessary for the project...
+```{r,comment=FALSE,message=FALSE,error=FALSE}
+library(MSEntropy)
+library(dplyr)
+library(reshape2)
+library(readbulk)
+library(readr)
+library(tidyr)
+library(ggplot2)
+library(ggpubr)
+library(scales)
+library(eegUtils)
+library(colorspace)
+library(patchwork)
+```
+
+Now read in your data...
+try keeping only the first two electrodes to make sure that grouping is electrode *within* subject not vice-versa
+```{r,comment=FALSE,message=FALSE,error=FALSE,echo=FALSE, warning=FALSE}
+#first read all the files into a dataframe using the "readbulk package"
+#the subdirectories =TRUE function means that we expect every person's data to be in a separate subdirectory. We're using the read_table2 function since our data is tab-separated, but we could easily adapt this to read CSV files etc.
+
+temp <- read_bulk(directory = "/Users/john/Downloads/MSE_shedden_2019/BE_ERP_text_files/test2/", extension =".txt", subdirectories = TRUE,fun = read_table2)
+#remove columns that aren't electrodes
+temp$X69 <- NULL
+#reshape the dataset from wide to long format so that we can calculate entropy by variable (electrode)
+temp2 <- melt(temp, id.vars=c("File", "Subdirectory"))
+#convert the value from character or whatever to numeric
+temp2$value <- as.numeric(temp2$value)
+
+#now we want to grab the file names which uniquely identify each person and condition
+files <- unique(temp$File)
+electrodes <- colnames(temp)
+electrodes <- head(electrodes,-2)
+#now get a list of files and electrodes
+files_electrodes <- expand.grid(electrodes, files)
+files_electrodes_combo <-paste(files_electrodes$Var1, files_electrodes$Var2,sep = "_") 
+```
+Now calculate MSE by condition/participant
+```{r,comment=FALSE,message=FALSE,error=FALSE,echo=FALSE, warning=FALSE}
+#this function calculates MSE using scales 1:20 with an r of 0.5 - change these values if you are interested in looking at this. We've specified that input$subdirectory is NULL and input$File is NULL which removes these non-numeric inputs before calculating MSE
+
+#sets number of scales (normally 20)
+scalenum=20
+
+MSE_func <- function(input,scalenum){
+  input$Subdirectory <- NULL
+  input$File <- NULL
+  input$variable <- NULL
+  MSEntropy::MSE(x = as.matrix(input),scales = 1:scalenum,r = 0.5,m = 2)
+}
+
+#Finally, we apply the MSE function we defined above to the whole data frame (temp), but specify that the function should be applied within each File (the group_by File command). We then specify that we want the output to be a dataframe and that the names should be the unique file identifiers.
+MSE_out <- temp2 %>%
+  group_by(File, variable) %>% #Make sure that the grouping is within electrode and within subject (variable = electrode)
+  group_map(~ MSE_func(.x, scalenum)) %>%
+  data.frame()%>% #everything up to here works...
+  setNames(files_electrodes_combo) %>%
+  rename_all(
+    funs(stringr::str_replace_all(., ".txt", ""))
+    )
+#define the bins using the length of the data structure (sequence along from 1 to length of data frame & add this variable to the output)
+MSE_out$bin <- seq(from=1, to=length(MSE_out[,1]))
+#now melt the dataframe (go to long format) to make it easier to split the subject ID and variable information
+MSE_out_long <- melt(MSE_out,id.vars = "bin")%>% 
+  separate(variable, "_",
+                into = c("Electrode", "ID", "MSE","test","date","context","Cond","accuracy"), 
+                remove = FALSE)
+#	MSE_out_long$ID = substr(MSE_out_long$ID_Cond,1,4)
+#	MSE_out_long$Cond = substr(MSE_out_long$ID_Cond,5,9)
+	
+#now put the data into a format that can be analyzed (bin and condition by ID)	
+MSE_out_long <- subset(MSE_out_long, select=c("ID","Cond", "context","Electrode","bin","value"))
+(MSE_out_wide <- dcast(data = MSE_out_long, formula = ID + Cond + context ~ Electrode + bin, value.var = "value"))
+	
+#test plotting function
+fz <- subset(MSE_out_long, Electrode == "AF8")
+ggplot(fz, aes(x=bin, y = value, color=Cond, group=Cond))+
+  stat_summary(
+    geom = "point",
+    fun.y = "mean",
+    size = 3,
+    shape = 24,aes(col=Cond)
+  )	+ 
+  scale_color_manual(values=c("darkred","darkgreen"))+facet_wrap( ~ context)+theme_pubr()
+```
+PLS analysis
+
+```{r}
+#
+library(TExPosition)
+library(TInPosition)
+library(data4PCCAR)
+
+
+X <- subset(MSE_out_wide, select=c("Cond","context"))
+X <- fastDummies::dummy_cols(X)
+X$Cond<- NULL
+X$context <- NULL
+Y <- MSE_out_wide
+Y$ID <- NULL
+Y$Cond<-NULL
+Y$context<-NULL
+
+pls.mse <- tepPLS(DATA1 = Y, DATA2 = X, center1 = TRUE, scale1 = TRUE, center2 = TRUE, scale2 = TRUE,graphs = FALSE, k = 2)
+
+
+#now using the bootstrap ratios from the Boot4PLSC function in the data4PCCAR package
+#Dataset 1 (fISO) is represented by "i" in the output, while dataset 2 (Tau) is represented by j in the output
+pls.boot <- Boot4PLSC(X, Y, center1 = TRUE, center2 = TRUE,
+  scale1 = "ss1", scale2 = "ss1", Fi = NULL, Fj = NULL,
+  nf2keep = 3, nIter = 1000, critical.value = 2, eig = FALSE,
+  alphaLevel = 0.05)
+
+pls.perm <- perm4PLSC(X, Y, center1 = TRUE, center2 = TRUE,
+  scale1 = "ss1", scale2 = "ss1", nIter = 1000, permType = "byMat",
+  compact = FALSE)
+pls.perm$pOmnibus
+
+
+```
+
+Plotting the results...
+
+```{r default-geom, fig.height = 4, fig.width = 4}
+#coordinates for the EEG plot
+EEG_64_coords <- read_csv("EEG_64_coords.csv")
+
+#for the function below - choose the LV number you want to plot.
+brain_fig <- function(lv_numeric){
+LV <-as.data.frame(pls.boot$bootRatios.j[,lv_numeric])
+LV <- tibble::rownames_to_column(LV, "Electrode")%>% 
+  separate(Electrode, "_",
+                into = c("Electrode", "bin")) %>%
+  `colnames<-`(c("Electrode","bin","BSR"))
+#merge the Lv1 bootstrap ratio data with the column indicating reliability
+Lv_rel <- as.data.frame(pls.boot$bootRatiosSignificant.j[,lv_numeric])
+Lv_rel <- tibble::rownames_to_column(Lv_rel, "Electrode")%>% 
+  separate(Electrode, "_",
+                into = c("Electrode", "bin")) 
+output <- merge(LV, EEG_64_coords, by ="Electrode")
+output <- merge(output, Lv_rel, by =c("Electrode","bin"))%>%
+  `colnames<-`(c("Electrode","bin","BSR","x","y","z","reliable"))
+output$bin <- as.factor(as.numeric(output$bin)) 
+return(assign(paste("Lv",lv_numeric, sep=""), output))
+}
+
+Lv1 <- brain_fig(1)
+Lv2 <- brain_fig(2)
+
+
+brain_plot_LV1 <- ggplot(Lv1,
+       aes(x = x,
+           y = y,
+           fill = BSR,
+           label = Electrode)) +
+  geom_topo(grid_res = 200,
+            interp_limit = "head",
+            chan_size=0.5,head_size = 0.5)+ 
+  #scale_fill_continuous_diverging(palette = "Blue-Red 3", breaks=c(-4,-2,0,2)) + 
+    scale_fill_viridis_c(breaks=c(-4,-2,0,2))+
+  theme_void() + 
+  coord_equal() + 
+  labs(fill = expression(paste("BSR"))) + 
+  facet_wrap(~bin)+
+  theme_void()+ 
+  ggtitle('Plot 1')
+
+brain_plot_LV2 <- ggplot(Lv2,
+       aes(x = x,
+           y = y,
+           fill = BSR,
+           label = Electrode)) +
+  geom_topo(grid_res = 200,
+            interp_limit = "head",
+            chan_size=0.5,head_size = 0.5)+ 
+  #scale_fill_continuous_diverging(palette = "Blue-Red 3", breaks=c(-4,-2,0,2)) + 
+    scale_fill_viridis_c(breaks=c(-4,-2,0,2))+
+  theme_void() + 
+  coord_equal() + 
+  labs(fill = expression(paste("BSR"))) + 
+  facet_wrap(~bin)+
+  theme_void()+ 
+  ggtitle('Plot 3')
+
+#doing this with geom tile
+cols=c("gray","black")
+
+Tile_Plot_LV1 <- ggplot(Lv1, aes(x = bin, y= Electrode)) +
+    geom_tile(aes(fill = BSR, colour=factor(reliable), size=factor(reliable)))+ #alpha=reliable==FALSE
+    #scale_fill_continuous_diverging(palette = "Blue-Red 3", breaks=c(-4,-2,0,2))+
+  scale_fill_viridis_c(breaks=c(-4,-2,0,2))+
+  #scale_alpha_manual(values = c(1, 0.5), guide = FALSE)+
+    scale_colour_manual(values=cols)+
+    scale_size_manual(values=c(0,0.5))+ 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+ theme(legend.position = "none") + 
+  ggtitle('Plot 2')
+
+Tile_Plot_LV2 <- ggplot(Lv2, aes(x = bin, y= Electrode)) +
+    geom_tile(aes(fill = BSR, colour=factor(reliable), size=factor(reliable)))+ #alpha=reliable==FALSE
+    #scale_fill_continuous_diverging(palette = "Blue-Red 3", breaks=c(-4,-2,0,2))+
+  scale_fill_viridis_c(breaks=c(-4,-2,0,2))+
+  #scale_alpha_manual(values = c(1, 0.5), guide = FALSE)+
+    scale_colour_manual(values=cols)+
+    scale_size_manual(values=c(0,0.5))+ 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+ theme(legend.position = "none") + 
+  ggtitle('Plot 4')
+  
+
+
+ggarrange(ggarrange(brain_plot_LV1, brain_plot_LV2, nrow=2), ggarrange(Tile_Plot_LV1, Tile_Plot_LV2, nrow=2), ncol=2, widths = c(2,1))
+#if screen freezes: dev.set(dev.next())
+
+##### using the topoplot function
+#topoplot(data=subset(Lv2, bin==5),
+#         palette = "magma",
+#         highlights = c("B5"),
+#         interp_limit = "head",limits = c(-3,3))
+```
